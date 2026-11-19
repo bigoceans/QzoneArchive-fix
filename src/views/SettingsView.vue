@@ -4,10 +4,10 @@ import { onMounted, ref, watch } from "vue";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
-import { getVersion } from "@tauri-apps/api/app";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
-import { deleteAllAppData } from "../utils/qzone";
+import { deleteAllAppData, getDataDir, setDataDir } from "../utils/qzone";
 
 const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
@@ -16,15 +16,24 @@ const privacyVisible = ref(false);
 const deleteVisible = ref(false);
 const deleting = ref(false);
 const error = ref("");
-const appVersion = ref("");
+const dataDir = ref("");
+const dataDirVisible = ref(false);
 
-onMounted(async () => {
+async function refreshDataDir() {
+  try { dataDir.value = await getDataDir(); }
+  catch (reason) { dataDir.value = `读取失败：${String(reason)}`; }
+}
+
+async function chooseDataDir() {
   try {
-    appVersion.value = await getVersion();
-  } catch (reason) {
-    console.warn("读取应用版本失败", reason);
-  }
-});
+    const picked = await open({ directory: true, multiple: false, title: "选择数据存放位置" });
+    if (typeof picked !== "string" || !picked) return;
+    dataDir.value = await setDataDir(picked);
+    dataDirVisible.value = true;
+  } catch (reason) { error.value = `设置数据目录失败：${String(reason)}`; }
+}
+
+onMounted(refreshDataDir);
 
 watch(intervalMs, (value) => { intervalMs.value = setArchiveInterval(value); });
 
@@ -54,6 +63,11 @@ async function deleteEverything() {
     </article>
 
     <article class="surface-card settings-card">
+      <div class="settings-copy"><span class="settings-icon tone-blue"><i class="pi pi-folder-open" /></span><div><h3>存储位置</h3><p>归档数据保存在此目录，默认位于程序旁的 userData 文件夹。可自由更改。</p><small class="data-dir-path">{{ dataDir || "读取中…" }}</small></div></div>
+      <Button label="更改位置" icon="pi pi-folder" severity="secondary" outlined @click="chooseDataDir" />
+    </article>
+
+    <article class="surface-card settings-card">
       <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-shield" /></span><div><h3>隐私协议</h3><p>了解登录凭证、归档内容和网络请求的处理方式。</p></div></div>
       <Button label="查看协议" icon="pi pi-angle-right" icon-pos="right" severity="secondary" text @click="privacyVisible = true" />
     </article>
@@ -64,13 +78,16 @@ async function deleteEverything() {
     </article>
 
     <p v-if="error" class="archive-error"><i class="pi pi-exclamation-circle" />{{ error }}</p>
-    <article class="surface-card settings-card about-card">
-      <div class="about-main">
-        <div class="settings-copy"><span class="settings-icon"><i class="pi pi-info-circle" /></span><div><h3>关于</h3><p>Qzone Archive · 跨平台空间归档工具</p><p class="author-line">作者：LibraHp_0928</p></div></div>
-        <span class="version-badge">{{ appVersion ? `v${appVersion}` : "版本未知" }}</span>
-      </div>
-    </article>
   </section>
+
+  <Dialog v-model:visible="dataDirVisible" modal :draggable="false" class="privacy-dialog" header="存储位置已更新">
+    <div class="privacy-content">
+      <p>新的数据目录已生效：</p>
+      <p><strong>{{ dataDir }}</strong></p>
+      <p>原有归档和登录状态仍在旧位置，程序不会自动搬运。若需要迁移，请手动复制旧目录中的内容；确认无误后可删除旧目录。</p>
+    </div>
+    <template #footer><Button label="好的" @click="dataDirVisible = false" /></template>
+  </Dialog>
 
   <Dialog v-model:visible="privacyVisible" modal :draggable="false" class="privacy-dialog" header="隐私协议">
     <div class="privacy-content">

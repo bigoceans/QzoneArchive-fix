@@ -12,9 +12,7 @@ use std::{
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
-use tauri::Manager;
-
-use crate::{qlogin::QLoginState, qzone};
+use crate::{data_dir, qlogin::QLoginState, qzone};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -250,13 +248,8 @@ fn archive_page_delay_ms(interval_ms: u64) -> u64 {
     interval_ms + subsecond_nanos % (jitter_range + 1)
 }
 
-fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
-    fs::create_dir_all(&dir).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    Ok(dir.join("qzone-archive.sqlite3"))
+fn database_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    data_dir::database_path()
 }
 
 fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
@@ -1053,12 +1046,7 @@ pub async fn load_archived_image(
     picture_index: usize,
 ) -> Result<String, String> {
     let auth = login.qzone_auth().await?;
-    let image_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
-        .join("images")
-        .join(&auth.uin);
+    let image_dir = data_dir::images_dir()?.join(&auth.uin);
     fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
     let file_stem = format!("{id}-{picture_index}");
     if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
@@ -1205,11 +1193,7 @@ pub async fn load_archived_video(
     id: i64,
 ) -> Result<String, String> {
     let auth = login.qzone_auth().await?;
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
-        .join("videos");
+    let cache_dir = data_dir::videos_dir()?;
     fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
     let cache_path = cache_dir.join(format!("{}-{id}.mp4", auth.uin));
     if cache_path
@@ -2841,19 +2825,11 @@ pub async fn delete_all_app_data(
             fs::remove_file(&path).map_err(|error| format!("删除应用数据库失败：{error}"))?;
         }
     }
-    let videos = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法获取缓存目录：{error}"))?
-        .join("videos");
+    let videos = data_dir::videos_dir()?;
     if videos.exists() {
         fs::remove_dir_all(videos).map_err(|error| format!("删除视频缓存失败：{error}"))?;
     }
-    let images = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
-        .join("images");
+    let images = data_dir::images_dir()?;
     if images.exists() {
         fs::remove_dir_all(images).map_err(|error| format!("删除图片归档失败：{error}"))?;
     }

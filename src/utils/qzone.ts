@@ -58,6 +58,8 @@ export const getInteractionRanking = (limit = 8) => invoke<InteractionRank[]>("g
 export const deleteArchivedFeeds = (ids: number[]) => invoke<number>("delete_archived_feeds", { ids });
 export const clearArchivedFeeds = () => invoke<number>("clear_archived_feeds");
 export const deleteAllAppData = () => invoke<void>("delete_all_app_data");
+export const getDataDir = () => invoke<string>("get_data_dir");
+export const setDataDir = (path: string) => invoke<string>("set_data_dir", { path });
 
 export const openRecyclePasswordWindow = () => invoke<void>("open_recycle_password_window");
 export const checkRecyclePassword = () => invoke<string | null>("check_recycle_password");

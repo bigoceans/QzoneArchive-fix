@@ -1,4 +1,5 @@
 mod archive;
+mod data_dir;
 mod qlogin;
 mod qzone;
 
@@ -10,6 +11,10 @@ fn exit_app(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            data_dir::grant_asset_scope(app.handle())?;
+            Ok(())
+        })
         .manage(archive::ArchiveState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
@@ -20,6 +25,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             exit_app,
+            data_dir::get_data_dir,
+            data_dir::set_data_dir,
             qlogin::start_qr_login,
             qlogin::poll_qr_login,
             qlogin::get_login_status,
