@@ -12,6 +12,8 @@ use crate::qlogin::QLoginState;
 
 const FEEDS_URL: &str = "https://mobile.qzone.qq.com/get_feeds";
 const FEED_RESPONSE_ATTEMPTS: u32 = 6;
+/// 单次抓取过程中，遭遇腾讯 WAF 拦截时最多轮换 User-Agent 的次数。
+const WAF_UA_ROTATION_LIMIT: u32 = 6;
 const RECYCLE_WINDOW_LABEL: &str = "qzone-recycle-auth";
 const RECYCLE_ALBUM_LIST_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_alist_recycle_v2";
@@ -766,7 +768,22 @@ pub async fn recover_recycle_photos(
     Ok(parsed)
 }
 
+/// 识别腾讯 WAF / STGW 网关拦截：HTTP 501，或响应体是 waf.tencent.com 的拦截页。
+/// 这类响应与账号、Cookie 无关，只对当前 User-Agent 生效，轮换 UA 即可恢复。
+fn is_waf_block(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::NOT_IMPLEMENTED {
+        return true;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("waf.tencent.com")
+        || lowered.contains("501page.html")
+        || (lowered.contains("not implemented") && lowered.contains("501"))
+}
+
 fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<String> {
+    if is_waf_block(status, body) {
+        return Some(format!("HTTP {status}（疑似腾讯 WAF 拦截，轮换 UA 后仍失败）"));
+    }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return Some(format!("HTTP {status}"));
     }
@@ -984,6 +1001,9 @@ async fn fetch_feeds_with_attempts(
     attempts: u32,
 ) -> Result<FeedPage, String> {
     let auth = state.qzone_auth().await?;
+    // UA 需要可在 WAF 命中时轮换：鉴权信息（uin/g_tk/cookie）固定，只有 UA 可变。
+    let mut current_ua = auth.user_agent.clone();
+    let mut waf_rotations = 0u32;
     let mut query = vec![
         ("g_tk", auth.g_tk.to_string()),
         ("res_type", "1".into()),
@@ -997,7 +1017,7 @@ async fn fetch_feeds_with_attempts(
                 "validate_request",
                 FEEDS_URL,
                 &query,
-                &auth.user_agent,
+                &current_ua,
                 None,
                 None,
                 None,
@@ -1020,7 +1040,9 @@ async fn fetch_feeds_with_attempts(
     let mut failed_response_body = None;
     let mut last_attempt_logged = false;
     let attempts = attempts.max(1);
-    for attempt in 1..=attempts {
+    let mut attempt = 0u32;
+    while attempt < attempts {
+        attempt += 1;
         match client
             .get(FEEDS_URL)
             .header(ACCEPT, "application/json")
@@ -1029,14 +1051,14 @@ async fn fetch_feeds_with_attempts(
             .header(PRAGMA, "no-cache")
             .header(ORIGIN, "https://h5.qzone.qq.com")
             .header(REFERER, "https://h5.qzone.qq.com/")
-            .header(USER_AGENT, &auth.user_agent)
+            .header(USER_AGENT, &current_ua)
             .header(COOKIE, &auth.cookie_header)
             .header("Sec-Fetch-Dest", "empty")
             .header("Sec-Fetch-Mode", "cors")
             .header("Sec-Fetch-Site", "same-site")
-            .header("Sec-Ch-Ua", sec_ch_ua(&auth.user_agent))
+            .header("Sec-Ch-Ua", sec_ch_ua(&current_ua))
             .header("Sec-Ch-Ua-Mobile", "?1")
-            .header("Sec-Ch-Ua-Platform", sec_platform(&auth.user_agent))
+            .header("Sec-Ch-Ua-Platform", sec_platform(&current_ua))
             .query(&query)
             .send()
             .await
@@ -1068,7 +1090,7 @@ async fn fetch_feeds_with_attempts(
                         &format!("read_response_attempt_{attempt}"),
                         &request_url,
                         &query,
-                        &auth.user_agent,
+                        &current_ua,
                         Some(status),
                         Some(&headers),
                         Some(&body),
@@ -1083,6 +1105,31 @@ async fn fetch_feeds_with_attempts(
                         tokio::time::sleep(feed_retry_delay(attempt)).await;
                     }
                 } else {
+                    // 腾讯 WAF 拦截（典型为 HTTP 501 + waf.tencent.com 拦截页）：
+                    // 与账号/Cookie 无关，仅当前 UA 被标记。轮换 UA 后立即重试，不空等退避。
+                    if is_waf_block(status, &body) && waf_rotations < WAF_UA_ROTATION_LIMIT {
+                        waf_rotations += 1;
+                        let next_ua = state.rotate_user_agent().await;
+                        let detail = format!(
+                            "检测到腾讯 WAF 拦截（HTTP {status}），已自动轮换 User-Agent（第 {waf_rotations}/{WAF_UA_ROTATION_LIMIT} 次轮换，第 {attempt}/{attempts} 次请求）"
+                        );
+                        transport_attempts.push(detail.clone());
+                        log_feed_request_error(
+                            &format!("waf_ua_rotation_{waf_rotations}"),
+                            &request_url,
+                            &query,
+                            &current_ua,
+                            Some(status),
+                            Some(&headers),
+                            Some(&body),
+                            &transport_attempts,
+                            &detail,
+                        );
+                        current_ua = next_ua;
+                        // 立刻重试：不 sleep，且轮换不占用普通重试次数。
+                        attempt -= 1;
+                        continue;
+                    }
                     if let Some(reason) = retryable_response_reason(status, &body) {
                         let detail = format!("{reason}（第 {attempt}/{attempts} 次）");
                         transport_attempts.push(detail.clone());
@@ -1090,7 +1137,7 @@ async fn fetch_feeds_with_attempts(
                             &format!("retryable_response_attempt_{attempt}"),
                             &request_url,
                             &query,
-                            &auth.user_agent,
+                            &current_ua,
                             Some(status),
                             Some(&headers),
                             Some(&body),
@@ -1139,7 +1186,7 @@ async fn fetch_feeds_with_attempts(
                 stage,
                 &request_url,
                 &query,
-                &auth.user_agent,
+                &current_ua,
                 failed_response_status,
                 failed_response_headers.as_ref(),
                 failed_response_body.as_deref(),
@@ -1155,7 +1202,7 @@ async fn fetch_feeds_with_attempts(
             "http_status",
             &request_url,
             &query,
-            &auth.user_agent,
+            &current_ua,
             Some(status),
             Some(&headers),
             Some(&body),
@@ -1172,7 +1219,7 @@ async fn fetch_feeds_with_attempts(
                 "parse_json",
                 &request_url,
                 &query,
-                &auth.user_agent,
+                &current_ua,
                 Some(status),
                 Some(&headers),
                 Some(&body),
@@ -1189,7 +1236,7 @@ async fn fetch_feeds_with_attempts(
                 "parse_api_response",
                 &request_url,
                 &query,
-                &auth.user_agent,
+                &current_ua,
                 Some(status),
                 Some(&headers),
                 Some(&body),
@@ -1216,9 +1263,20 @@ pub async fn fetch_more_feeds(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_qzone_success, feed_error_can_skip, parse_feed_page, parse_qzone_json, retryable_response_reason, FEEDS_URL};
+    use super::{ensure_qzone_success, feed_error_can_skip, is_waf_block, parse_feed_page, parse_qzone_json, retryable_response_reason, FEEDS_URL};
     use reqwest::StatusCode;
     use serde_json::json;
+
+    #[test]
+    fn detects_tencent_waf_block() {
+        assert!(is_waf_block(StatusCode::NOT_IMPLEMENTED, ""));
+        assert!(is_waf_block(
+            StatusCode::FORBIDDEN,
+            "<html>请访问 https://waf.tencent.com/501page.html</html>"
+        ));
+        assert!(!is_waf_block(StatusCode::OK, "{\"code\":0,\"data\":{}}"));
+        assert!(!is_waf_block(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
+    }
 
     #[test]
     fn keeps_first_page_feeds_and_cursor() {

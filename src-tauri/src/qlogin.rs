@@ -21,7 +21,7 @@ const DAID: &str = "5";
 const MOBILE_USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 15; Pixel 8 Build/AP3A.241105.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; SM-S938B Build/AP3A.241105.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 14; SM-S9280 Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 14; 23127PN0CC Build/UKQ1.231003.002) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 14; V2309A Build/UP1A.231005.007) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36",
@@ -104,6 +104,26 @@ impl QLoginState {
         selected
     }
 
+    /// 轮换到一个与当前会话 UA 不同的移动端 UA（用于绕过腾讯 WAF 对特定 UA 的封禁）。
+    /// 会同步写入 session 与 last_user_agent，使后续所有接口请求都使用新 UA。
+    pub(crate) async fn rotate_user_agent(&self) -> String {
+        let current = {
+            let guard = self.session.lock().await;
+            guard.as_ref().map(|session| session.user_agent.clone())
+        };
+        let mut previous = self.last_user_agent.lock().await;
+        let selected = select_mobile_user_agent_avoiding(previous.as_deref(), current.as_deref());
+        *previous = Some(selected.clone());
+        drop(previous);
+        let mut guard = self.session.lock().await;
+        if let Some(session) = guard.as_mut() {
+            session.user_agent = selected.clone();
+            // 同步刷新预热用的指纹 Cookie，避免 UA 与指纹不匹配触发风控
+            refresh_device_fingerprint(&mut session.cookies);
+        }
+        selected
+    }
+
     pub(crate) async fn clear_session(&self) {
         *self.session.lock().await = None;
     }
@@ -170,13 +190,34 @@ fn random_alphanum(len: usize) -> String {
 }
 
 fn select_mobile_user_agent(previous: Option<&str>) -> String {
+    select_mobile_user_agent_avoiding(previous, None)
+}
+
+/// 选一个既不等于 `previous`、也不等于 `current` 的移动端 UA，尽量扩大轮换跨度。
+fn select_mobile_user_agent_avoiding(previous: Option<&str>, current: Option<&str>) -> String {
     let sequence = USER_AGENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let seed = unix_millis() as usize ^ sequence.wrapping_mul(0x9E37_79B1);
     let mut index = seed % MOBILE_USER_AGENTS.len();
-    if previous.is_some_and(|value| value == MOBILE_USER_AGENTS[index]) {
+    // 最多轮询一整圈，确保不会选中 current / previous，也不会在 UA 池只有 1 个时死循环。
+    for _ in 0..MOBILE_USER_AGENTS.len() {
+        let candidate = MOBILE_USER_AGENTS[index];
+        if current.is_none_or(|value| value != candidate)
+            && previous.is_none_or(|value| value != candidate)
+        {
+            return candidate.to_owned();
+        }
         index = (index + 1) % MOBILE_USER_AGENTS.len();
     }
     MOBILE_USER_AGENTS[index].to_owned()
+}
+
+/// UA 轮换后刷新移动端设备指纹 Cookie，避免 UA 与旧指纹不匹配被风控识别。
+fn refresh_device_fingerprint(cookies: &mut HashMap<String, String>) {
+    cookies.insert("_qimei_fingerprint".into(), random_hex(32));
+    cookies.insert("_qimei_uuid42".into(), random_hex(42));
+    cookies.insert("_qimei_i_3".into(), random_hex(87));
+    cookies.insert("_qimei_h38".into(), format!("{}0{}", random_hex(25), random_hex(12)));
+    cookies.insert("_qimei_i_1".into(), random_hex(97));
 }
 
 fn account_user_agent(uin: &str) -> String {
@@ -218,7 +259,8 @@ fn bkn(p_skey: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        bkn, callback_query_value, ptqr_token, select_mobile_user_agent, MOBILE_USER_AGENTS,
+        bkn, callback_query_value, ptqr_token, select_mobile_user_agent,
+        select_mobile_user_agent_avoiding, MOBILE_USER_AGENTS,
     };
 
     #[test]
@@ -245,6 +287,27 @@ mod tests {
             callback_query_value(response, "ptsigx").as_deref(),
             Some("abc123")
         );
+    }
+
+    #[test]
+    fn rotation_never_reuses_current_or_previous_ua() {
+        // 覆盖池中所有 UA，验证轮换结果一定不同于 current 与 previous。
+        for (i, current) in MOBILE_USER_AGENTS.iter().enumerate() {
+            let previous = MOBILE_USER_AGENTS[(i + 1) % MOBILE_USER_AGENTS.len()];
+            for _ in 0..20 {
+                let selected = select_mobile_user_agent_avoiding(Some(previous), Some(current));
+                assert_ne!(selected.as_str(), *current);
+                assert_ne!(selected.as_str(), previous);
+                assert!(MOBILE_USER_AGENTS.contains(&selected.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn flagged_pixel_8_ua_is_removed_from_pool() {
+        assert!(MOBILE_USER_AGENTS
+            .iter()
+            .all(|ua| !ua.contains("Pixel 8")));
     }
 
     #[test]
@@ -576,7 +639,11 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
         })?;
     session.g_tk = Some(bkn(p_skey));
     session.uin = Some(uin.clone());
-    session.user_agent = account_user_agent(&uin);
+    // 不再用 QQ 号 hash 覆盖 UA：固定 UA 一旦被腾讯 WAF 标记，该账号的所有请求都会 100% 命中 501。
+    // 保留扫码阶段已随机选好的 UA，仅当为空时才回退到账号 hash 候选。
+    if session.user_agent.trim().is_empty() {
+        session.user_agent = account_user_agent(&uin);
+    }
     // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
     let warmup_ua = session.user_agent.clone();
     warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
@@ -707,7 +774,8 @@ pub async fn check_web_login(
         })?;
 
     let g_tk = bkn(&p_skey);
-    let user_agent = account_user_agent(&uin);
+    // 与扫码登录一致：使用随机轮换 UA，避免账号 hash 固定命中被 WAF 标记的 User-Agent。
+    let user_agent = state.next_mobile_user_agent().await;
     let normalized = normalized_uin(&uin);
 
     // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
